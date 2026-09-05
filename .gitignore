@@ -4,3 +4,4 @@ data/
 .tmp-e2etest/
 .env
 *.log
+plan/.state/
