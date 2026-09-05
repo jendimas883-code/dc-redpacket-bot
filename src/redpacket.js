@@ -19,11 +19,11 @@ function setClient(c) { client = c; }
 
 const fmt = (n) => Number(n).toLocaleString('en-US');
 
-// 网站明确拒绝、重试也不可能成功的错误。NETWORK/5xx/HTTP_408/409/425 属于结果未知
-// （请求可能已在网站生效）——判成未知最多多试几次（同 ref 幂等，重试安全），
-// 判成确定丢的是真钱，所以拿不准一律按未知处理，交给 sweep 收敛
+// 网站明确拒绝、重试也不可能成功的错误。NETWORK/5xx/HTTP_408/409/425/429 属于结果未知
+// （请求可能已在网站生效，429 限流同样不保证未处理）——判成未知最多多试几次（同 ref
+// 幂等，重试安全），判成确定丢的是真钱，所以拿不准一律按未知处理，交给 sweep 收敛
 const DEFINITIVE_CODES = new Set(['USER_NOT_FOUND', 'INSUFFICIENT_BALANCE', 'UNAUTHORIZED']);
-const AMBIGUOUS_HTTP = new Set(['HTTP_408', 'HTTP_409', 'HTTP_425']);
+const AMBIGUOUS_HTTP = new Set(['HTTP_408', 'HTTP_409', 'HTTP_425', 'HTTP_429']);
 function isDefinitive(err) {
   const code = err?.code || '';
   return DEFINITIVE_CODES.has(code)
@@ -368,6 +368,7 @@ module.exports = {
   expireSweep,
   startSweeper,
   parseAmount,
+  isDefinitive,
   UNIT_NAME,
   EXPIRY_MINUTES,
 };

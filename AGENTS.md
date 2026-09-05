@@ -47,3 +47,8 @@ Discord 红包盲盒机器人：查网站额度、发拼手气红包、抢红包
 ## 部署
 
 前台 `npm start`；生产 pm2（`pm2 start src/index.js --name dc-redpacket-bot`）。重启不丢账：未领完红包与 pending 入账由启动时 `expireSweep()` 扫描恢复——依赖"DB 是唯一真相，消息展示可以重建"这一原则。
+
+**存量数据审计（首次真实部署前）**：本项目从未有过生产部署，正常情况下无存量数据。若未来从带资金缺陷的中间版本迁移生产库，先审计两类危险行再切换（详见 `plan/` 冷审记录）：
+
+- `redpackets` 中 `status='cancelled' AND refund_status='pending'` 且退款键为旧格式 `refund_<id>` 的行——新代码换用 `refund_<deduct_ref>` 键重试会对已退款行双退，须逐行人工核对网站侧流水后处置，**禁止盲跑迁移 SQL**；
+- `claims` 中 `credit_status='failed' AND refund_status='none'` 的孤儿份额——执行 `UPDATE claims SET refund_status='pending' WHERE credit_status='failed' AND refund_status='none';` 交给 sweep 以 `refund_claim_` 键回收（该组合新代码不会产生，此 SQL 安全）。

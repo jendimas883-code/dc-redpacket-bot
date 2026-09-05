@@ -51,6 +51,21 @@ async function run() {
   }
   await ok('边界与范围校验（300 轮随机）', async () => {});
 
+  console.log('— isDefinitive 判定表 —');
+  await ok('确定/未知边界（含 429 限流回归）', async () => {
+    const D = (code) => rp.isDefinitive({ code });
+    // 网站明确拒绝：重试也不会成功
+    for (const c of ['USER_NOT_FOUND', 'INSUFFICIENT_BALANCE', 'UNAUTHORIZED', 'HTTP_400', 'HTTP_402', 'HTTP_418']) {
+      assert.strictEqual(D(c), true, `${c} 应判「确定」`);
+    }
+    // 结果未知：请求可能已在网站生效，必须同 ref 重试收敛——判错方向是丢真钱
+    for (const c of ['NETWORK', 'HTTP_408', 'HTTP_409', 'HTTP_425', 'HTTP_429', 'HTTP_500', 'HTTP_503']) {
+      assert.strictEqual(D(c), false, `${c} 应判「未知」`);
+    }
+    assert.strictEqual(rp.isDefinitive(undefined), false);
+    assert.strictEqual(rp.isDefinitive(new Error('普通错误无 code')), false, '无 code 按未知重试');
+  });
+
   console.log('— mock 扣款 / 入账 —');
   mockApi.reset();
   await ok('新用户默认余额、扣款、入账、幂等', async () => {

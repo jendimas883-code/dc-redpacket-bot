@@ -326,12 +326,42 @@ async function run() {
     assert.strictEqual((await mockApi.getBalance('u1')).balance, before, '同 ref 重试去重后退款，资金回到原点');
   });
 
+  await ok('deduct 已在网站生效但返回 429（限流）→ 按结果未知收敛，不得作废吞钱', async () => {
+    const api = require('../src/api');
+    const { ApiError } = require('../src/apiError');
+    const before = (await mockApi.getBalance('u1')).balance;
+    const origDeduct = api.deduct;
+    let firstDeductSeen = false;
+    api.deduct = async (discordId, amount, ref) => {
+      await mockApi.deduct(discordId, amount, ref); // 站点事务已提交
+      if (!firstDeductSeen) {
+        firstDeductSeen = true;
+        throw new ApiError('HTTP_429', '请求过于频繁');
+      }
+      return { balance: (await mockApi.getBalance(discordId)).balance };
+    };
+    let pid;
+    try {
+      await submitModal('u1', '2', '20');
+      pid = store.db.prepare('SELECT MAX(id) AS id FROM redpackets').get().id;
+      assert.strictEqual(store.stmts.getPacket.get(pid).status, 'creating', '429 属结果未知，不得作废');
+      store.db.prepare('UPDATE redpackets SET created_at = ? WHERE id = ?')
+        .run(Date.now() - 120_000, pid);
+      await rp.expireSweep();
+    } finally {
+      api.deduct = origDeduct;
+    }
+    assert.strictEqual(store.stmts.getPacket.get(pid).status, 'cancelled');
+    assert.strictEqual((await mockApi.getBalance('u1')).balance, before, '限流后的同键重试应收敛退款');
+  });
+
   await ok('入账被网站明确拒绝（USER_NOT_FOUND）→ 份额退回发送者且恰一次', async () => {
     const api = require('../src/api');
     const { ApiError } = require('../src/apiError');
     const origCredit = api.credit;
-    // 只拦 claim_ 入账键。份额退款键 refund_claim_…（前缀是 refund_）必须放行到 mock——
-    // 刻意设计：若改退款键前缀，这里会静默失效
+    // 只拦 claim_ 入账键。份额退款键 refund_claim_…（前缀是 refund_）会放行到 mock——
+    // 注意：若退款键前缀改成完全不含 claim_ 字样的形式，本用例仍会通过但不再覆盖
+    // 份额退款路径；若改成 claim_ 开头则会显式失败。改键时必须回来更新本用例
     api.credit = async (discordId, amount, purpose, ref) => {
       if (String(ref).startsWith('claim_')) throw new ApiError('USER_NOT_FOUND', '用户不存在');
       return mockApi.credit(discordId, amount, purpose, ref);

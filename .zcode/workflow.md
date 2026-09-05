@@ -23,7 +23,7 @@
   ```bash
   npm run selftest && npm run e2etest && npm run flowtest
   ```
-  预期输出各段 `全部通过 ✓`（2026-09-05 基线：selftest 11/11，e2etest 14/14，flowtest 全部通过）。数量随用例增加，汇报引用真实输出行。
+  预期输出各段 `全部通过 ✓`（2026-09-05 基线：selftest 12/12，e2etest 15/15，flowtest 全部通过）。数量随用例增加，汇报引用真实输出行。
 - **分层**：三套脚本各覆盖一层：
   - `npm run selftest` = 核心逻辑（store 事务 / splitRand 拆分 / mockApi 幂等 / expireSweep / createPacket / 旧库迁移）
   - `npm run e2etest` = 交互层（假 Discord interaction 驱动 balance + redpacket 全流程 + 失败注入）
@@ -49,7 +49,7 @@
 - **资金恰好一次**：扣款（`createPacket` → `api.deduct`）、入账（`api.credit`）、退款（`redpacket_refund`）三条路径都靠 ref 幂等去重，重复请求不得重复记账。
 - **幂等 ref 约定**：`send_<guild>_<sender>_<ts>_<uuid>`（扣款）/ `claim_{claimId}`（领取入账）/ `refund_{packetId}`（过期退回）/ `refund_${deductRef}` = `refund_send_<guild>_<sender>_<ts>_<uuid>`（发送失败补偿，**三处统一同键**：createPacket 内联首退、sweep 阶段 0、阶段 3 cancelled 臂）/ `refund_claim_{claimId}`（领取份额退回发送者）。改 ref 格式 = 改幂等键，需迁移与存量论证，不走快车道；**同一笔钱的补偿重试禁止换键**（换键 = 绕过网站幂等 = 双记账）。
 - **SQLite 状态机**：`redpackets.status`（creating→active→finished/expired；失败面世→cancelled，终态）、`redpackets.refund_status`（none/pending/ok/failed 终态）、`claims.credit_status`（pending/ok/failed 终态）、`claims.refund_status`（none/pending/ok/failed 终态）。并发抢红包的正确性全靠 `store.claimTx` 事务——禁止把领取判断 / 扣减移出事务，禁止给非幂等的 credit 调用加"直接重试"；作废与补偿标记必须同事务（`cancelPacketTx` / `failClaimTx`），禁止拆成裸语句。
-- **失败补偿收敛**：任何异步副作用（credit/deduct/发消息）失败都必须有补偿路径，且补偿以 DB 记录为准由 sweep 重试收敛（`expireSweep` 五段：收敛 creating 的未知扣款 → 补发 pending 入账（definitive 拒绝 → 份额退回发送者）→ 退回被拒份额 → 标记过期 → 按 status 分流退剩余/全部）；新增异步副作用必须回答"进程死在半路怎么办"。确定/未知错误判据在 `isDefinitive`：`HTTP_408/409/425`、5xx、NETWORK 一律按未知（同 ref 重试收敛），判成确定丢的是真钱。
+- **失败补偿收敛**：任何异步副作用（credit/deduct/发消息）失败都必须有补偿路径，且补偿以 DB 记录为准由 sweep 重试收敛（`expireSweep` 五段：收敛 creating 的未知扣款 → 补发 pending 入账（definitive 拒绝 → 份额退回发送者）→ 退回被拒份额 → 标记过期 → 按 status 分流退剩余/全部）；新增异步副作用必须回答"进程死在半路怎么办"。确定/未知错误判据在 `isDefinitive`：`HTTP_408/409/425/429`、5xx、NETWORK 一律按未知（同 ref 重试收敛），判成确定丢的是真钱；判定表被 selftest 单测钉死，改判定先改测试。
 - **对外契约**：`docs/API_CONTRACT.md` 是给网站团队的接口契约（含原子扣款、ref 幂等两条硬要求）。改它 = 改对外接口契约，不走快车道；`src/api.js` 是唯一对接点，mock（`src/mockApi.js`）与真实实现必须行为一致（selftest 对 mock 断言了幂等语义）。
 
 ## 路径
