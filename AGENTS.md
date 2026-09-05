@@ -6,7 +6,7 @@ Discord 红包盲盒机器人：查网站额度、发拼手气红包、抢红包
 
 - **bot 不碰网站数据库**。与网站的全部交互收敛在 `src/api.js` 一个适配层，只有 3 个调用：`getBalance` / `deduct` / `credit`。换接口只改 api.js + API_CONTRACT.md。
 - `src/mockApi.js` 是 `MOCK_API=true` 时的同签名实现，**行为必须与 API_CONTRACT.md 一致**（尤其幂等语义）——selftest 对 mock 断言幂等，改 mock 语义先过测试。
-- Discord 侧只做展示与收集：`src/index.js`（入口/分发）、`src/commands/balance.js`（命令+表单）、`src/redpacket.js`（业务）、`src/store.js`（SQLite 状态）。业务逻辑不 import discord.js（redpacket.js 除外：渲染与刷新消息），保证 selftest 无 token 可跑。
+- Discord 侧只做展示与收集：`src/index.js`（入口/登录/命令注册）、`src/router.js`（interaction 分发 + 未知交互兜底 + 全局错误兜底）、`src/commands/balance.js`（命令+表单）、`src/redpacket.js`（业务）、`src/store.js`（SQLite 状态）。业务逻辑不 import discord.js（redpacket.js 除外：渲染与刷新消息），保证 selftest 无 token 可跑；router 独立成模块是为了 e2etest 能直接驱动路由层。
 
 ## 资金红线（绝对型不变量，任何 diff 触及都要最严格对待）
 

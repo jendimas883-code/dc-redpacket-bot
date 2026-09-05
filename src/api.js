@@ -4,7 +4,6 @@
 // MOCK_API=true 时切换到内置 mock（src/mockApi.js），调用方无感知。
 
 const { ApiError } = require('./apiError');
-const mock = require('./mockApi');
 
 const BASE_URL = (process.env.API_BASE_URL || '').replace(/\/+$/, '');
 const API_KEY = process.env.API_KEY || '';
@@ -61,8 +60,12 @@ async function credit(discordId, amount, purpose, ref) {
   });
 }
 
-const impl = (process.env.MOCK_API || 'true').toLowerCase() === 'true' ? mock : {
-  getBalance, deduct, credit,
-};
+// MOCK_API 未配置时默认走 mock（本地开发零配置可跑），但真实部署忘配会静默用假额度——
+// 所以 IS_MOCK 随模块导出，index.js 启动时必须把运行模式打到日志里
+const IS_MOCK = (process.env.MOCK_API || 'true').toLowerCase() === 'true';
 
-module.exports = { ...impl, ApiError };
+const impl = IS_MOCK
+  ? require('./mockApi') // 惰性加载：真实模式下不引入 mock 模块
+  : { getBalance, deduct, credit };
+
+module.exports = { ...impl, ApiError, IS_MOCK };

@@ -23,7 +23,7 @@
   ```bash
   npm run selftest && npm run e2etest && npm run flowtest
   ```
-  预期输出各段 `全部通过 ✓`（2026-09-05 基线：selftest 12/12，e2etest 15/15，flowtest 全部通过）。数量随用例增加，汇报引用真实输出行。
+  预期输出各段 `全部通过 ✓`（2026-09-05 基线：selftest 12/12，e2etest 18/18，flowtest 全部通过）。数量随用例增加，汇报引用真实输出行。
 - **分层**：三套脚本各覆盖一层：
   - `npm run selftest` = 核心逻辑（store 事务 / splitRand 拆分 / mockApi 幂等 / expireSweep / createPacket / 旧库迁移）
   - `npm run e2etest` = 交互层（假 Discord interaction 驱动 balance + redpacket 全流程 + 失败注入）

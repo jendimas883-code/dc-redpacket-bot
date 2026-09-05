@@ -17,7 +17,7 @@ Discord 机器人：用户查询自己在网站上的额度，一键发"拼手�
 1. 打开 [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**，起个名字。
 2. 左侧 **Bot** → **Reset Token**，复制 token（只显示一次）。
 3. 左侧 **General Information** → 复制 **Application ID**。
-4. 左侧 **OAuth2 → URL Generator**：勾选 `bot` 和 `applications.commands` 两个 scope；Bot Permissions 勾选 `Send Messages`、`Embed Links`、`Read Message History`。复制生成的 URL，在浏览器打开，把 bot 拉进你的服务器。
+4. 左侧 **OAuth2 → URL Generator**：勾选 `bot` 和 `applications.commands` 两个 scope；Bot Permissions 勾选 `View Channel`、`Send Messages`、`Embed Links`、`Read Message History`。复制生成的 URL，在浏览器打开，把 bot 拉进你的服务器。（若 bot 只授权了特定频道，需在该频道单独授予 `View Channel`）
 5. 服务器里右键 bot 头像可复制其 ID；服务器 ID：设置里打开"开发者模式"后右键服务器名复制。
 
 不需要开启任何 Privileged Gateway Intents。
@@ -52,6 +52,7 @@ mock 模式下每个用户初始有 10000 额度（可用 `MOCK_START_BALANCE` �
 ```bash
 npm start          # 前台运行
 npm run selftest   # 核心逻辑自测（不需要 Discord token）
+npm run soaktest   # 稳定性连跑（默认 10 轮 × 三套测试）
 ```
 
 生产环境建议 pm2：
@@ -61,6 +62,8 @@ npm install -g pm2
 pm2 start src/index.js --name dc-redpacket-bot
 pm2 save
 ```
+
+> **生产部署前必读**：`.env` 中必须设置 `MOCK_API=false` 并配置真实 `API_BASE_URL` / `API_KEY`，否则 bot 会静默运行在 mock 模式——用户看到的是内存里的假额度，不产生任何真实扣款/入账。启动日志会打印「运行模式：MOCK/真实网站接口」，**生产环境看到 MOCK 必须立即停下检查 .env**。
 
 ## 验证清单
 
@@ -74,7 +77,8 @@ pm2 save
 
 ```
 src/
-├── index.js            # 入口：登录、命令注册、交互分发
+├── index.js            # 入口：登录、命令注册
+├── router.js           # interaction 分发路由（含未知交互兜底与全局错误兜底）
 ├── commands/balance.js # /额度查询 + 红包表单（Modal）
 ├── redpacket.js        # 发红包、抢、拼手气拆分、过期退款
 ├── store.js            # SQLite 记录（红包 / 领取 / 退款状态）
@@ -83,6 +87,9 @@ src/
 └── apiError.js
 docs/API_CONTRACT.md    # 给网站团队的接口文档
 scripts/selftest.js     # 核心逻辑自测
+scripts/e2etest.js      # 交互层测试（假 interaction 驱动）
+scripts/flowtest.js     # 整体流程演练 + 金额守恒总账
+scripts/soaktest.js     # 稳定性连跑
 ```
 
 ## 给网站团队的对接要点

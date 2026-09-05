@@ -218,6 +218,10 @@ async function handleGrab(interaction) {
   const userId = interaction.user.id;
   const now = Date.now();
 
+  // 先占住 Discord 3 秒应答窗口再做事：defer 失败时领取尚未发生，用户可直接重试，
+  // 不会出现「领取已落库但用户零反馈」；此后所有应答都走 editReply，不再有裸 reply
+  await interaction.deferReply({ ephemeral: true });
+
   const result = store.claimTx(packetId, userId, now);
   if (!result.ok) {
     const text = {
@@ -226,16 +230,14 @@ async function handleGrab(interaction) {
       empty: '手慢了，红包已被抢完',
       already: '你已经领过这个红包啦',
     }[result.reason] || '领取失败';
-    await interaction.reply({ content: text, ephemeral: true });
+    await interaction.editReply({ content: text });
     const packet = store.stmts.getPacket.get(packetId);
     if (packet && packet.status !== 'active') await refreshMessage(packet);
     return;
   }
 
-  // 先应答占用 Discord 3 秒窗口；入账要等网站（最长 10 秒），完成后编辑同一条回复
-  await interaction.deferReply({ ephemeral: true });
-
-  // 入账失败不回滚领取资格，状态一律留给 sweep 收敛；这里只按错误类型选文案
+  // 入账要等网站（最长 10 秒），应答已在函数开头完成；入账失败不回滚领取资格，
+  // 状态一律留给 sweep 收敛，这里只按错误类型选文案
   let creditNote;
   try {
     await api.credit(userId, result.amount, 'redpacket_claim', `claim_${result.claimId}`);

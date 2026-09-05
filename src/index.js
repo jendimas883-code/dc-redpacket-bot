@@ -8,6 +8,8 @@ const {
 const store = require('./store');
 const rp = require('./redpacket');
 const balance = require('./commands/balance');
+const api = require('./api');
+const { handleInteraction } = require('./router');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -34,6 +36,10 @@ async function registerCommands(rest) {
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`已登录：${c.user.tag}`);
+  console.log(`运行模式：${api.IS_MOCK ? 'MOCK（内存假额度，仅测试用）' : '真实网站接口'}`);
+  if (api.IS_MOCK) {
+    console.warn('当前处于 MOCK 模式：额度是假的，不产生真实扣款/入账。生产部署必须设置 MOCK_API=false。');
+  }
   rp.setClient(client);
   try {
     await registerCommands(new REST().setToken(DISCORD_TOKEN));
@@ -46,28 +52,8 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`红包过期时间 ${rp.EXPIRY_MINUTES} 分钟，数据文件 ${store.DB_PATH}`);
 });
 
-client.on(Events.InteractionCreate, async (interaction) => {
-  try {
-    if (interaction.isChatInputCommand() && interaction.commandName === '额度查询') {
-      await balance.execute(interaction);
-    } else if (interaction.isButton() && interaction.customId === 'rp_open') {
-      await balance.handleOpenButton(interaction);
-    } else if (interaction.isButton() && interaction.customId.startsWith('rp_grab_')) {
-      await rp.handleGrab(interaction);
-    } else if (interaction.isModalSubmit() && interaction.customId === 'rp_create') {
-      await balance.handleModalSubmit(interaction);
-    }
-  } catch (err) {
-    console.error('交互处理异常:', err);
-    const payload = { content: '出错了，请稍后再试。', ephemeral: true };
-    try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply(payload.content);
-      } else if (interaction.isRepliable()) {
-        await interaction.reply(payload);
-      }
-    } catch { /* 消息可能已过期，忽略 */ }
-  }
+client.on(Events.InteractionCreate, (interaction) => {
+  handleInteraction(interaction).catch((err) => console.error('[router] 处理链异常:', err));
 });
 
 process.on('SIGINT', () => client.destroy());

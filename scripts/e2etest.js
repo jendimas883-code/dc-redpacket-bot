@@ -75,6 +75,13 @@ function makeInteraction(over = {}) {
     async editReply(p) { calls.editReply.push(p); return p; },
     async reply(p) { this.replied = true; calls.reply.push(p); },
     async showModal(m) { calls.showModal.push(m); },
+    // 冷审 F4：补齐真实 discord.js 的类型判定方法，路由层测试需要它们；
+    // 注意假对象的 deferred/replied 仍是同步置位，与真实 REST 后置位有差异
+    isChatInputCommand: () => over.kind === 'command',
+    isButton: () => over.kind === 'button',
+    isModalSubmit: () => over.kind === 'modal',
+    isAutocomplete: () => false,
+    isRepliable: () => true,
     ...over,
   };
   return { i, calls };
@@ -127,6 +134,31 @@ async function run() {
     assert.ok(inputs.every((c) => c.required));
   });
 
+  console.log('— interaction 路由（冷审 F1/F4 防复发）—');
+  await ok('未知按钮必须有应答有日志，不得静默丢弃', async () => {
+    const { handleInteraction } = require('../src/router');
+    const { i, calls } = makeInteraction({ kind: 'button', customId: 'rp_what_999' });
+    await handleInteraction(i);
+    assert.match(calls.reply[0].content, /未知操作/, '未知交互应回复用户');
+  });
+  await ok('rp_grab_ 按钮分发到抢红包处理', async () => {
+    const { handleInteraction } = require('../src/router');
+    const { i, calls } = makeInteraction({
+      kind: 'button', customId: 'rp_grab_99999', user: { id: 'uRouter', bot: false },
+    });
+    await handleInteraction(i);
+    assert.match(calls.editReply[0].content, /不存在/, '应路由到 handleGrab（不存在的红包被拒）');
+  });
+  await ok('/额度查询 分发到命令处理', async () => {
+    const { handleInteraction } = require('../src/router');
+    const { i, calls } = makeInteraction({
+      kind: 'command', commandName: '额度查询', user: { id: 'uRouter', bot: false },
+    });
+    await handleInteraction(i);
+    assert.strictEqual(calls.deferReply.length, 1, '应路由到 balance.execute');
+    assert.match(norm(calls.editReply[0]).embeds[0].description, /uRouter/);
+  });
+
   console.log('— 表单提交发红包 —');
   await ok('正常发红包：扣款、频道出消息、回复确认', async () => {
     const calls = await submitModal('u1', '3', '90');
@@ -163,7 +195,7 @@ async function run() {
     const before = (await mockApi.getBalance('u2')).balance;
     const { i, calls } = makeInteraction({ customId: 'rp_grab_1', user: { id: 'u2', bot: false } });
     await rp.handleGrab(i);
-    assert.match(calls.reply[0].content, /已经领过/);
+    assert.match(calls.editReply[0].content, /已经领过/);
     assert.strictEqual((await mockApi.getBalance('u2')).balance, before);
   });
 
@@ -177,7 +209,7 @@ async function run() {
     const before = (await mockApi.getBalance('u5')).balance;
     const { i, calls } = makeInteraction({ customId: 'rp_grab_1', user: { id: 'u5', bot: false } });
     await rp.handleGrab(i);
-    assert.match(calls.reply[0].content, /已被抢完/);
+    assert.match(calls.editReply[0].content, /已被抢完/);
     assert.strictEqual((await mockApi.getBalance('u5')).balance, before);
     const last = norm(editsOf.m1.at(-1));
     assert.strictEqual(last.embeds[0].footer.text, '已抢完');
