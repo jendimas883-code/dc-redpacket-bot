@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "selftest": "node scripts/selftest.js",
-    "e2etest": "node scripts/e2etest.js"
+    "e2etest": "node scripts/e2etest.js",
+    "flowtest": "node scripts/flowtest.js"
   },
   "engines": {
     "node": ">=20"
