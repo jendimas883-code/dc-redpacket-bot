@@ -7,7 +7,8 @@
     "start": "node src/index.js",
     "selftest": "node scripts/selftest.js",
     "e2etest": "node scripts/e2etest.js",
-    "flowtest": "node scripts/flowtest.js"
+    "flowtest": "node scripts/flowtest.js",
+    "soaktest": "node scripts/soaktest.js"
   },
   "engines": {
     "node": ">=20"

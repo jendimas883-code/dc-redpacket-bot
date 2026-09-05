@@ -28,6 +28,7 @@
   - `npm run selftest` = 核心逻辑（store 事务 / splitRand 拆分 / mockApi 幂等 / expireSweep / createPacket / 旧库迁移）
   - `npm run e2etest` = 交互层（假 Discord interaction 驱动 balance + redpacket 全流程 + 失败注入）
   - `npm run flowtest` = 整体流程演练（多用户多红包交错剧本 + 金额守恒总账核对）
+  - `npm run soaktest` = 稳定性连跑（默认 10 轮 × 三套，传参可调轮数）
 - 测试不需要 Discord token 和真实网站接口（强制 `MOCK_API=true`、`DB_PATH` 指向各自独立临时目录 `.tmp-selftest/`、`.tmp-e2etest/`、`.tmp-flowtest/`，整目录清空重建，**绝不碰生产库所在的 `./data/`**）。
 - **不引入测试框架**（vitest/jest 等）：沿用 `scripts/` 现有自写断言风格（`node:assert` + `ok()` 包装 + `process.exitCode`）。新功能在对应层补用例，资金路径必须含失败注入用例。
 
