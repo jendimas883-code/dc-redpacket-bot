@@ -23,6 +23,8 @@ db.exec(`
     remaining_amount INTEGER NOT NULL,
     remaining_count  INTEGER NOT NULL,
     expires_at       INTEGER NOT NULL,
+    deduct_ref       TEXT,
+    created_at       INTEGER,
     status           TEXT NOT NULL DEFAULT 'active',
     refund_status    TEXT NOT NULL DEFAULT 'none'
   );
@@ -38,16 +40,29 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_claims_packet ON claims(packet_id);
 `);
 
+// 老库平滑升级：新列已存在时 ALTER 会报错，忽略即可
+try { db.exec('ALTER TABLE redpackets ADD COLUMN deduct_ref TEXT'); } catch { /* 已有该列 */ }
+try { db.exec('ALTER TABLE redpackets ADD COLUMN created_at INTEGER'); } catch { /* 已有该列 */ }
+
 const stmts = {
   insertPacket: db.prepare(`
     INSERT INTO redpackets (guild_id, channel_id, sender_id, total_amount, count,
-                            remaining_amount, remaining_count, expires_at)
+                            remaining_amount, remaining_count, expires_at,
+                            deduct_ref, created_at, status)
     VALUES (@guild_id, @channel_id, @sender_id, @total_amount, @count,
-            @total_amount, @count, @expires_at)`),
+            @total_amount, @count, @expires_at,
+            @deduct_ref, @created_at, @status)`),
   setMessageId: db.prepare('UPDATE redpackets SET message_id = ? WHERE id = ?'),
   getPacket: db.prepare('SELECT * FROM redpackets WHERE id = ?'),
   getActiveExpired: db.prepare(
     "SELECT * FROM redpackets WHERE status = 'active' AND expires_at <= ?"),
+  getStaleCreating: db.prepare(
+    "SELECT * FROM redpackets WHERE status = 'creating' AND created_at <= ?"),
+  activatePacket: db.prepare(
+    "UPDATE redpackets SET status = 'active' WHERE id = ? AND status = 'creating'"),
+  // 作废从未成功面世的红包：不能再被抢，也不会被过期 sweep 二次退款
+  cancelPacket: db.prepare(
+    "UPDATE redpackets SET status = 'cancelled' WHERE id = ? AND status IN ('creating', 'active')"),
   finishPacket: db.prepare("UPDATE redpackets SET status = 'finished' WHERE id = ?"),
   expirePacket: db.prepare(`
     UPDATE redpackets

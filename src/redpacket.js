@@ -3,6 +3,7 @@
 const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
 } = require('discord.js');
+const crypto = require('node:crypto');
 const store = require('./store');
 const api = require('./api');
 
@@ -17,6 +18,15 @@ let client = null;
 function setClient(c) { client = c; }
 
 const fmt = (n) => Number(n).toLocaleString('en-US');
+
+// 网站明确拒绝、重试也不可能成功的错误；NETWORK/5xx 属于结果未知，交给 sweep 用同一 ref 重试收敛
+function isDefinitive(err) {
+  const code = err?.code || '';
+  return code === 'USER_NOT_FOUND'
+    || code === 'INSUFFICIENT_BALANCE'
+    || code === 'UNAUTHORIZED'
+    || (/^HTTP_4/.test(code) && code !== 'HTTP_429');
+}
 
 function parseAmount(text) {
   const t = String(text || '').trim();
@@ -124,13 +134,9 @@ async function createPacket({ guildId, channel, senderId, countText, totalText }
     return { ok: false, error: `可用额度不足：当前 ${fmt(balance)}，需要 ${fmt(total)}` };
   }
 
-  const deductRef = `send_${guildId}_${senderId}_${Date.now()}`;
-  try {
-    await api.deduct(senderId, total, deductRef);
-  } catch (err) {
-    return { ok: false, error: `扣款失败：${err.message}` };
-  }
+  const deductRef = `send_${guildId}_${senderId}_${Date.now()}_${crypto.randomUUID()}`;
 
+  // 先落库（creating，此时还没扣款），之后的每一步失败都有记录可查、可收敛
   let packet;
   try {
     const id = store.stmts.insertPacket.run({
@@ -140,25 +146,57 @@ async function createPacket({ guildId, channel, senderId, countText, totalText }
       total_amount: total,
       count,
       expires_at: Date.now() + EXPIRY_MINUTES * 60_000,
+      deduct_ref: deductRef,
+      created_at: Date.now(),
+      status: 'creating',
     }).lastInsertRowid;
     packet = store.stmts.getPacket.get(id);
+  } catch (err) {
+    console.error('[redpacket] 红包落库失败（尚未扣款，无资金影响）:', err);
+    return { ok: false, error: '创建红包失败，请稍后重试' };
+  }
 
+  try {
+    await api.deduct(senderId, total, deductRef);
+  } catch (err) {
+    if (isDefinitive(err)) {
+      store.stmts.cancelPacket.run(packet.id);
+      const msg = err.code === 'USER_NOT_FOUND'
+        ? '网站里找不到你的账号，请先去网站用 Discord 登录一次'
+        : `扣款失败：${err.message}`;
+      return { ok: false, error: msg };
+    }
+    // 扣款结果未知（超时/断连）：钱可能扣了也可能没扣，sweep 会用同一 ref
+    // 重试到确定结果，然后把额度原路退回，这里不退款不作废
+    console.error(`[redpacket] 扣款结果未知，待 sweep 核对 (packet ${packet.id}, ref ${deductRef}):`, err.message);
+    return { ok: false, error: '网络波动，红包没有发出去，额度正在核对，稍后会自动退回' };
+  }
+
+  try {
     const msg = await channel.send({
       embeds: [packetEmbed(packet, [])],
       components: packetComponents(packet),
     });
-    store.stmts.setMessageId.run(msg.id, id);
-    packet.message_id = msg.id;
-    return { ok: true, packet };
+    store.stmts.setMessageId.run(msg.id, packet.id);
+    store.stmts.activatePacket.run(packet.id);
+    return { ok: true, packet: store.stmts.getPacket.get(packet.id) };
   } catch (err) {
     // 发红包后半程失败，把扣掉的钱退回去（credit 幂等，重试安全）
     console.error('[redpacket] 创建红包失败，退款中:', err);
+    let refunded = true;
     try {
-      await api.credit(senderId, total, 'redpacket_refund', `refund_send_${deductRef}`);
+      await api.credit(senderId, total, 'redpacket_refund', `refund_${deductRef}`);
     } catch (refundErr) {
-      console.error('[redpacket] 退款也失败了，需人工处理:', refundErr, deductRef);
+      refunded = false;
+      console.error('[redpacket] 退款失败，已标记待 sweep 重试:', refundErr, deductRef);
     }
-    return { ok: false, error: '发送失败，额度已退回，请稍后重试' };
+    // 关键：红包从未面世，作废它，否则过期 sweep 会用另一个幂等键把剩余额度再退一次（双退款）
+    store.stmts.cancelPacket.run(packet.id);
+    if (!refunded) store.stmts.setRefundStatus.run('pending', packet.id);
+    return {
+      ok: false,
+      error: refunded ? '发送失败，额度已退回，请稍后重试' : '发送失败，额度退回遇到网络问题，稍后会自动重试',
+    };
   }
 }
 
@@ -183,6 +221,9 @@ async function handleGrab(interaction) {
     return;
   }
 
+  // 先应答占用 Discord 3 秒窗口；入账要等网站（最长 10 秒），完成后编辑同一条回复
+  await interaction.deferReply({ ephemeral: true });
+
   // 入账失败不回滚领取资格，标记 pending 由定时任务用同一幂等键重试
   let creditOk = true;
   try {
@@ -193,11 +234,10 @@ async function handleGrab(interaction) {
     console.error(`[redpacket] 入账失败，待重试 (claim ${result.claimId}):`, err.message);
   }
 
-  await interaction.reply({
+  await interaction.editReply({
     content: creditOk
       ? `🎉 抢到 **${fmt(result.amount)}** ${UNIT_NAME}！已存入你的额度`
       : `🎉 抢到 **${fmt(result.amount)}** ${UNIT_NAME}！入账稍有延迟，稍后自动到账`,
-    ephemeral: true,
   });
   await refreshMessage(store.stmts.getPacket.get(packetId));
 }
@@ -205,13 +245,41 @@ async function handleGrab(interaction) {
 // ---------- 过期退款 + 待重试入账 ----------
 
 async function expireSweep(now = Date.now()) {
+  // 0) 收敛创建中途断掉的红包：用同一个 deduct ref 重试到确定结果，
+  //    确认扣上后原路退回；确认没扣上则作废。任何一步网络失败都留在 creating 下轮再试。
+  for (const p of store.stmts.getStaleCreating.all(now - CREDIT_RETRY_DELAY_MS)) {
+    let deducted = false;
+    try {
+      await api.deduct(p.sender_id, p.total_amount, p.deduct_ref);
+      deducted = true;
+      await api.credit(p.sender_id, p.total_amount, 'redpacket_refund', `refund_${p.deduct_ref}`);
+      store.stmts.cancelPacket.run(p.id);
+    } catch (err) {
+      if (isDefinitive(err)) {
+        // 扣款被网站明确拒绝 = 钱没扣，直接作废；扣款成功后退款被明确拒绝 = 需人工处理
+        store.stmts.cancelPacket.run(p.id);
+        if (deducted) {
+          console.error(`[redpacket] 退款被网站拒绝，需人工处理 (packet ${p.id}, ref refund_${p.deduct_ref}):`, err.message);
+        }
+      } else {
+        console.error(`[redpacket] 创建核对未收敛，下轮重试 (packet ${p.id}):`, err.message);
+      }
+    }
+  }
+
   // 1) 补发之前入账失败的领取
   for (const c of store.stmts.getPendingCredits.all(now - CREDIT_RETRY_DELAY_MS)) {
     try {
       await api.credit(c.user_id, c.amount, 'redpacket_claim', `claim_${c.id}`);
       store.stmts.setClaimCreditStatus.run('ok', c.id);
     } catch (err) {
-      console.error(`[redpacket] 入账重试失败 (claim ${c.id}):`, err.message);
+      if (isDefinitive(err)) {
+        // 网站明确拒绝（如用户从未登录网站），重试永远不会成功，标记 failed 止损
+        store.stmts.setClaimCreditStatus.run('failed', c.id);
+        console.error(`[redpacket] 入账被网站拒绝，停止重试 (claim ${c.id}):`, err.message);
+      } else {
+        console.error(`[redpacket] 入账重试失败 (claim ${c.id}):`, err.message);
+      }
     }
   }
 

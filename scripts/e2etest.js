@@ -5,13 +5,14 @@
 // 完整走一遍：查额度 → 弹表单 → 发红包 → 抢 → 重复领 → 抢完 → 输入校验 → 余额不足 →
 // 发送失败退款 → 过期退款。不需要 Discord token，不需要网站接口。
 
-process.env.DB_PATH = './data/e2etest.db';
+process.env.DB_PATH = './.tmp-e2etest/e2etest.db';
 process.env.MOCK_API = 'true';
 
 const assert = require('node:assert');
 const fs = require('node:fs');
 
-fs.rmSync('./data', { recursive: true, force: true });
+// 只清自己的临时目录，绝不碰生产库所在的 ./data
+fs.rmSync('./.tmp-e2etest', { recursive: true, force: true });
 
 const store = require('../src/store');
 const mockApi = require('../src/mockApi');
@@ -145,8 +146,9 @@ async function run() {
     const before = (await mockApi.getBalance('u2')).balance;
     const { i, calls } = makeInteraction({ customId: 'rp_grab_1', user: { id: 'u2', bot: false } });
     await rp.handleGrab(i);
-    const m = calls.reply[0].content.match(/抢到 \*\*(\d+)\*\*/);
-    assert(m, `回复应包含抢到金额：${calls.reply[0].content}`);
+    assert.strictEqual(calls.deferReply[0].ephemeral, true, '应先在 3 秒窗口内应答');
+    const m = calls.editReply[0].content.match(/抢到 \*\*(\d+)\*\*/);
+    assert(m, `回复应包含抢到金额：${calls.editReply[0].content}`);
     grabbed.u2 = Number(m[1]);
     assert.strictEqual(
       (await mockApi.getBalance('u2')).balance,
@@ -169,7 +171,7 @@ async function run() {
     for (const uid of ['u3', 'u4']) {
       const { i, calls } = makeInteraction({ customId: 'rp_grab_1', user: { id: uid, bot: false } });
       await rp.handleGrab(i);
-      assert.match(calls.reply[0].content, /抢到/, `${uid} 应能抢到`);
+      assert.match(calls.editReply[0].content, /抢到/, `${uid} 应能抢到`);
     }
     assert.strictEqual(store.stmts.getPacket.get(1).status, 'finished');
     const before = (await mockApi.getBalance('u5')).balance;
@@ -213,6 +215,72 @@ async function run() {
       channel.shouldFailSend = false;
     }
     assert.strictEqual((await mockApi.getBalance('u1')).balance, before, '扣掉的钱应原路退回');
+    // 双退款回归（F1）：作废的红包绝不能被过期 sweep 再退一次
+    const row = store.stmts.getPacket.get(
+      store.db.prepare('SELECT MAX(id) AS id FROM redpackets').get().id);
+    assert.strictEqual(row.status, 'cancelled', '发送失败的红包应作废');
+    assert.strictEqual(row.refund_status, 'none');
+    await rp.expireSweep();
+    assert.strictEqual((await mockApi.getBalance('u1')).balance, before, 'sweep 不得对作废红包二次退款');
+  });
+
+  console.log('— 扣款结果未知收敛 —');
+  await ok('扣款超时（结果未知）→ sweep 用同一 ref 重试并自动退回', async () => {
+    const api = require('../src/api');
+    const { ApiError } = require('../src/apiError');
+    const before = (await mockApi.getBalance('u1')).balance;
+    const origDeduct = api.deduct;
+    api.deduct = async () => { throw new ApiError('NETWORK', '模拟超时'); };
+    let calls;
+    try {
+      calls = await submitModal('u1', '2', '20');
+    } finally {
+      api.deduct = origDeduct;
+    }
+    assert.match(calls.editReply[0].content, /核对/, '应告知用户额度在核对中');
+    const pid = store.db.prepare('SELECT MAX(id) AS id FROM redpackets').get().id;
+    const creating = store.stmts.getPacket.get(pid);
+    assert.strictEqual(creating.status, 'creating', '红包应停在 creating 等待收敛');
+    assert.strictEqual((await mockApi.getBalance('u1')).balance, before, '此时不应扣款');
+    assert.strictEqual(sentMessages.length, 1, '不应发出红包消息');
+
+    // 时间快进，sweep 接管：重试扣款（同 ref 幂等）→ 确认扣上 → 原路退回 → 作废
+    store.db.prepare('UPDATE redpackets SET created_at = ? WHERE id = ?')
+      .run(Date.now() - 120_000, pid);
+    await rp.expireSweep();
+    const done = store.stmts.getPacket.get(pid);
+    assert.strictEqual(done.status, 'cancelled', '收敛后红包应作废');
+    assert.strictEqual((await mockApi.getBalance('u1')).balance, before, '额度应自动退回');
+  });
+
+  await ok('入账被网站明确拒绝（USER_NOT_FOUND）→ 停止重试并标记 failed', async () => {
+    const api = require('../src/api');
+    const { ApiError } = require('../src/apiError');
+    const origCredit = api.credit;
+    api.credit = async (discordId, amount, purpose, ref) => {
+      if (String(ref).startsWith('claim_')) throw new ApiError('USER_NOT_FOUND', '用户不存在');
+      return mockApi.credit(discordId, amount, purpose, ref);
+    };
+    const before = (await mockApi.getBalance('u7')).balance;
+    let grabCalls;
+    let claimId;
+    try {
+      await submitModal('u6', '1', '5');
+      const pid = store.db.prepare('SELECT MAX(id) AS id FROM redpackets').get().id;
+      const { i, calls } = makeInteraction({ customId: `rp_grab_${pid}`, user: { id: 'u7', bot: false } });
+      await rp.handleGrab(i);
+      grabCalls = calls;
+      claimId = store.db.prepare('SELECT MAX(id) AS id FROM claims').get().id;
+      store.db.prepare('UPDATE claims SET claimed_at = ? WHERE id = ?').run(Date.now() - 120_000, claimId);
+      // sweep 也要在补丁作用域内跑，否则重试会直接成功，测不到止损分支
+      await rp.expireSweep();
+    } finally {
+      api.credit = origCredit;
+    }
+    assert.match(grabCalls.editReply[0].content, /稍后自动到账/);
+    const c = store.db.prepare('SELECT credit_status FROM claims WHERE id = ?').get(claimId);
+    assert.strictEqual(c.credit_status, 'failed', '确定性失败应标记 failed 止损，不得无限重试');
+    assert.strictEqual((await mockApi.getBalance('u7')).balance, before, '入账未成功不应加钱');
   });
 
   console.log('— 过期退款 —');
@@ -224,7 +292,7 @@ async function run() {
     const u5Before = (await mockApi.getBalance('u5')).balance;
     const { i, calls } = makeInteraction({ customId: `rp_grab_${packetId}`, user: { id: 'u5', bot: false } });
     await rp.handleGrab(i);
-    const claimAmt = Number(calls.reply[0].content.match(/抢到 \*\*(\d+)\*\*/)[1]);
+    const claimAmt = Number(calls.editReply[0].content.match(/抢到 \*\*(\d+)\*\*/)[1]);
     const afterClaims = store.stmts.getPacket.get(packetId);
     assert.strictEqual(afterClaims.remaining_count, 3);
 

@@ -3,14 +3,15 @@
 // 核心逻辑自测：npm run selftest
 // 覆盖：拼手气拆分、mock 扣款/入账、抢红包去重、过期退款、入账失败重试。
 
-process.env.DB_PATH = './data/selftest.db';
+process.env.DB_PATH = './.tmp-selftest/selftest.db';
 process.env.MOCK_API = 'true';
 process.env.EXPIRY_MINUTES = '120';
 
 const assert = require('node:assert');
 const fs = require('node:fs');
 
-fs.rmSync('./data', { recursive: true, force: true });
+// 只清自己的临时目录，绝不碰生产库所在的 ./data
+fs.rmSync('./.tmp-selftest', { recursive: true, force: true });
 
 const store = require('../src/store');
 const mockApi = require('../src/mockApi');
@@ -31,6 +32,8 @@ function insertPacket(senderId, total, count, expiresAt) {
   const id = store.stmts.insertPacket.run({
     guild_id: 'g1', channel_id: 'c1', sender_id: senderId,
     total_amount: total, count, expires_at: expiresAt,
+    deduct_ref: `selftest_${senderId}_${total}_${count}_${Math.random()}`,
+    created_at: Date.now(), status: 'active',
   }).lastInsertRowid;
   return store.stmts.getPacket.get(id);
 }

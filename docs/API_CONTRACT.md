@@ -79,7 +79,8 @@ POST /api/bot/redpacket/deduct
 
 - 必须是**数据库事务内的原子扣款**：余额不足则整体失败，绝不允许并发扣成负数。
 - 余额不足返回 `409`，`error.code = "INSUFFICIENT_BALANCE"`。
-- `ref` 是幂等键：同一个 `ref` 重复请求**不得重复扣款**，直接返回成功（网络重试时 bot 会带同一个 `ref`）。建议建一张唯一索引的流水表落实。
+- `ref` 是幂等键，格式为 `send_<guildId>_<senderId>_<毫秒时间戳>_<随机串>`：同一个 `ref` 重复请求**不得重复扣款**，直接返回成功。bot 会在两种情况下带同一个 `ref` 重发：①网络重试；②bot 侧收到超时/断连（结果未知）时，定时任务会用同一个 `ref` 重试直到拿到确定结果——网站必须能正确去重。建议建一张唯一索引的流水表落实。
+- 返回 `4xx`（如余额不足、用户不存在）代表「确定没扣」；返回 `5xx` 或不响应属于「结果未知」，bot 会按上面的方式重试，网站端应保证重试安全。
 
 ### 3. 红包入账（抢到 / 过期退回，同一个接口）
 
@@ -109,6 +110,17 @@ POST /api/bot/redpacket/credit
 }
 ```
 
+请求体（发送失败 / 创建未完成时的原路退回）：
+
+```json
+{
+  "discordId": "123456789012345678",
+  "amount": 500,
+  "purpose": "redpacket_refund",
+  "ref": "refund_send_987654321_123456789012345678_1725300000000_0b9e6c1e"
+}
+```
+
 响应 `data`：
 
 ```json
@@ -117,17 +129,18 @@ POST /api/bot/redpacket/credit
 
 **要求（重要）**：
 
-- `ref` 全局唯一幂等：同一 `ref` 重复请求不得重复入账。bot 侧 `ref` 规则固定为 `claim_{领取记录ID}` 和 `refund_{红包ID}`，天然唯一，落库时对 `ref` 建唯一索引即可。
+- `ref` 全局唯一幂等：同一 `ref` 重复请求不得重复入账。bot 侧 `ref` 规则固定为 `claim_{领取记录ID}`、`refund_{红包ID}`（过期退回）和 `refund_send_<原扣款ref去掉send_前缀>`（发送失败退回），天然唯一，落库时对 `ref` 建唯一索引即可。
 - 入账必须成功后 bot 才标记完成；网络抖动时 bot 会用同一 `ref` 重试，网站必须能正确去重。
+- 用户不存在（`USER_NOT_FOUND`）时 bot 会停止重试该笔入账并记为失败，不会无限重发。
 
 ## 错误码约定
 
 | code | HTTP | 含义 | bot 的处理 |
 |---|---|---|---|
-| `USER_NOT_FOUND` | 404 | Discord ID 在网站没有对应用户 | 提示用户先在网站用 Discord 登录一次 |
+| `USER_NOT_FOUND` | 404 | Discord ID 在网站没有对应用户 | 提示用户先在网站用 Discord 登录一次；领取入账遇此错误标记失败、不再重试 |
 | `INSUFFICIENT_BALANCE` | 409 | 余额不足 | 直接展示 message |
 | `UNAUTHORIZED` | 401 | X-Bot-Key 不对 | 记日志，不重试 |
-| `NETWORK` | - | bot 连不上网站（bot 侧错误码） | 记日志，红包退款走重试 |
+| `NETWORK` | - | bot 连不上网站或响应超时（bot 侧错误码） | 结果未知：用同一幂等 `ref` 重试直到拿到确定结果 |
 
 ## 实现顺序建议
 

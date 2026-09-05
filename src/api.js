@@ -42,7 +42,11 @@ async function request(method, pathname, body) {
 }
 
 async function getBalance(discordId) {
-  return request('GET', `/api/bot/users/${discordId}/balance`);
+  const data = await request('GET', `/api/bot/users/${discordId}/balance`);
+  if (typeof data.balance !== 'number') {
+    throw new ApiError('BAD_RESPONSE', '网站返回的余额格式不对');
+  }
+  return data;
 }
 
 async function deduct(discordId, amount, ref) {
