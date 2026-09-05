@@ -1,0 +1,261 @@
+'use strict';
+
+// 端到端交互测试：npm run e2etest
+// 用假的 Discord interaction 对象驱动真实的事件处理代码（commands/balance.js、redpacket.js），
+// 完整走一遍：查额度 → 弹表单 → 发红包 → 抢 → 重复领 → 抢完 → 输入校验 → 余额不足 →
+// 发送失败退款 → 过期退款。不需要 Discord token，不需要网站接口。
+
+process.env.DB_PATH = './data/e2etest.db';
+process.env.MOCK_API = 'true';
+
+const assert = require('node:assert');
+const fs = require('node:fs');
+
+fs.rmSync('./data', { recursive: true, force: true });
+
+const store = require('../src/store');
+const mockApi = require('../src/mockApi');
+const rp = require('../src/redpacket');
+const balance = require('../src/commands/balance');
+
+// ---------- 假的 Discord 环境 ----------
+
+let msgSeq = 0;
+const messageRegistry = {};   // messageId -> fakeMessage（记录所有 edit 调用）
+const editsOf = {};           // messageId -> [{ embeds, components }]
+const sentMessages = [];      // channel.send 收到的 { messageId, payload }
+
+function fakeMessage(id) {
+  editsOf[id] = [];
+  return {
+    id,
+    edit: async (payload) => { editsOf[id].push(payload); return this; },
+  };
+}
+
+const channel = {
+  id: 'ch1',
+  messages: { fetch: async (id) => messageRegistry[id] },
+  send: async (payload) => {
+    if (channel.shouldFailSend) throw new Error('boom');
+    const id = `m${++msgSeq}`;
+    messageRegistry[id] = fakeMessage(id);
+    sentMessages.push({ id, payload });
+    return messageRegistry[id];
+  },
+};
+
+// refreshMessage 走的就是这条路径：client.channels.fetch -> messages.fetch -> edit
+rp.setClient({ channels: { fetch: async () => channel } });
+
+// discord.js builder（Embed/ActionRow/Modal）统一转成 JSON 再断言，不碰 .data 内部结构
+const J = (x) => (x && typeof x.toJSON === 'function' ? x.toJSON() : x);
+const norm = (p) => ({
+  ...p,
+  embeds: (p?.embeds ?? []).map(J),
+  components: (p?.components ?? []).map(J),
+});
+
+function makeInteraction(over = {}) {
+  const calls = { deferReply: [], editReply: [], reply: [], showModal: [] };
+  const i = {
+    user: { id: 'u1', bot: false },
+    guildId: 'g1',
+    channelId: 'ch1',
+    channel,
+    customId: '',
+    commandName: '',
+    deferred: false,
+    replied: false,
+    fields: {
+      getTextInputValue: (k) => (over.fieldValues ? over.fieldValues[k] : ''),
+    },
+    async deferReply(opts) { this.deferred = true; calls.deferReply.push(opts); },
+    async editReply(p) { calls.editReply.push(p); return p; },
+    async reply(p) { this.replied = true; calls.reply.push(p); },
+    async showModal(m) { calls.showModal.push(m); },
+    ...over,
+  };
+  return { i, calls };
+}
+
+async function submitModal(userId, count, total, over = {}) {
+  const { i, calls } = makeInteraction({
+    user: { id: userId, bot: false },
+    fieldValues: { count, total },
+    ...over,
+  });
+  await balance.handleModalSubmit(i);
+  return calls;
+}
+
+// ---------- 断言 ----------
+
+let passed = 0;
+async function ok(name, fn) {
+  try {
+    await fn();
+    passed += 1;
+    console.log(`  ✓ ${name}`);
+  } catch (err) {
+    console.error(`  ✗ ${name}\n    ${err.message}`);
+    process.exitCode = 1;
+  }
+}
+
+async function run() {
+  console.log('— /额度查询 —');
+  await ok('显示可用额度和红包按钮', async () => {
+    const { i, calls } = makeInteraction({});
+    await balance.execute(i);
+    assert.strictEqual(calls.deferReply[0].ephemeral, true, '应当是仅自己可见');
+    const payload = norm(calls.editReply[0]);
+    assert.match(payload.embeds[0].description, /10,000/, 'mock 新用户应有 10000 额度');
+    const btn = payload.components[0].components[0];
+    assert.strictEqual(btn.custom_id, 'rp_open');
+  });
+
+  console.log('— 点「红包盲盒」按钮弹表单 —');
+  await ok('弹出含个数/总额度两个输入框的表单', async () => {
+    const { i, calls } = makeInteraction({ customId: 'rp_open' });
+    await balance.handleOpenButton(i);
+    const modal = J(calls.showModal[0]);
+    assert.strictEqual(modal.custom_id, 'rp_create');
+    const inputs = modal.components.flatMap((r) => r.components);
+    assert.deepStrictEqual(inputs.map((c) => c.custom_id), ['count', 'total']);
+    assert.ok(inputs.every((c) => c.required));
+  });
+
+  console.log('— 表单提交发红包 —');
+  await ok('正常发红包：扣款、频道出消息、回复确认', async () => {
+    const calls = await submitModal('u1', '3', '90');
+    assert.match(calls.editReply[0].content, /红包盲盒已发到/);
+    assert.strictEqual(sentMessages.length, 1);
+    const emb = norm(sentMessages[0].payload).embeds[0];
+    assert.match(emb.description, /<@u1>/);
+    assert.match(emb.description, /\*\*90\*\*/);
+    assert.strictEqual((await mockApi.getBalance('u1')).balance, 10000 - 90);
+    const p = store.stmts.getPacket.get(1);
+    assert.strictEqual(p.status, 'active');
+    assert.strictEqual(p.message_id, 'm1');
+  });
+
+  const grabbed = {};
+  await ok('别人点按钮能抢到，入账且消息更新', async () => {
+    const before = (await mockApi.getBalance('u2')).balance;
+    const { i, calls } = makeInteraction({ customId: 'rp_grab_1', user: { id: 'u2', bot: false } });
+    await rp.handleGrab(i);
+    const m = calls.reply[0].content.match(/抢到 \*\*(\d+)\*\*/);
+    assert(m, `回复应包含抢到金额：${calls.reply[0].content}`);
+    grabbed.u2 = Number(m[1]);
+    assert.strictEqual(
+      (await mockApi.getBalance('u2')).balance,
+      before + grabbed.u2,
+      'mock 起始额度 + 抢到金额');
+    const emb = norm(editsOf.m1.at(-1)).embeds[0];
+    const field = emb.fields[0].value;
+    assert.match(field, new RegExp(`<@u2> — \\*\\*${grabbed.u2}\\*\\*`));
+  });
+
+  await ok('同一人不能重复领', async () => {
+    const before = (await mockApi.getBalance('u2')).balance;
+    const { i, calls } = makeInteraction({ customId: 'rp_grab_1', user: { id: 'u2', bot: false } });
+    await rp.handleGrab(i);
+    assert.match(calls.reply[0].content, /已经领过/);
+    assert.strictEqual((await mockApi.getBalance('u2')).balance, before);
+  });
+
+  await ok('抢完最后一份后红包关闭，再来的人提示抢完', async () => {
+    for (const uid of ['u3', 'u4']) {
+      const { i, calls } = makeInteraction({ customId: 'rp_grab_1', user: { id: uid, bot: false } });
+      await rp.handleGrab(i);
+      assert.match(calls.reply[0].content, /抢到/, `${uid} 应能抢到`);
+    }
+    assert.strictEqual(store.stmts.getPacket.get(1).status, 'finished');
+    const before = (await mockApi.getBalance('u5')).balance;
+    const { i, calls } = makeInteraction({ customId: 'rp_grab_1', user: { id: 'u5', bot: false } });
+    await rp.handleGrab(i);
+    assert.match(calls.reply[0].content, /已被抢完/);
+    assert.strictEqual((await mockApi.getBalance('u5')).balance, before);
+    const last = norm(editsOf.m1.at(-1));
+    assert.strictEqual(last.embeds[0].footer.text, '已抢完');
+    const btn = last.components[0].components[0];
+    assert.strictEqual(btn.disabled, true, '抢完后按钮应禁用');
+  });
+
+  console.log('— 表单输入校验 —');
+  await ok('非法个数/总额 < 份数 被拒绝', async () => {
+    for (const [count, total, pattern] of [
+      ['0', '10', /个数/], ['abc', '10', /个数/], ['3', '2', /至少/],
+    ]) {
+      const beforeMsgs = sentMessages.length;
+      const calls = await submitModal('u1', count, total);
+      assert.match(calls.editReply[0].content, pattern, `count=${count} total=${total}`);
+      assert.strictEqual(sentMessages.length, beforeMsgs, '不应发消息');
+    }
+  });
+
+  await ok('余额不足被拒绝，不发消息不扣款', async () => {
+    mockApi.balances.set('uPoor', 5);
+    const calls = await submitModal('uPoor', '1', '10');
+    assert.match(calls.editReply[0].content, /不足/);
+    assert.strictEqual((await mockApi.getBalance('uPoor')).balance, 5);
+    assert.strictEqual(sentMessages.length, 1);
+  });
+
+  await ok('频道发送失败时自动退款', async () => {
+    const before = (await mockApi.getBalance('u1')).balance;
+    channel.shouldFailSend = true;
+    try {
+      const calls = await submitModal('u1', '2', '20');
+      assert.match(calls.editReply[0].content, /已退回/);
+    } finally {
+      channel.shouldFailSend = false;
+    }
+    assert.strictEqual((await mockApi.getBalance('u1')).balance, before, '扣掉的钱应原路退回');
+  });
+
+  console.log('— 过期退款 —');
+  await ok('过期后剩余额度退回发送者，消息标记已过期', async () => {
+    // u4 发一个 4 份 40 的红包，只被 u5 领走一份
+    const senderBefore = (await mockApi.getBalance('u4')).balance;
+    await submitModal('u4', '4', '40');
+    const packetId = store.db.prepare('SELECT MAX(id) AS id FROM redpackets').get().id;
+    const u5Before = (await mockApi.getBalance('u5')).balance;
+    const { i, calls } = makeInteraction({ customId: `rp_grab_${packetId}`, user: { id: 'u5', bot: false } });
+    await rp.handleGrab(i);
+    const claimAmt = Number(calls.reply[0].content.match(/抢到 \*\*(\d+)\*\*/)[1]);
+    const afterClaims = store.stmts.getPacket.get(packetId);
+    assert.strictEqual(afterClaims.remaining_count, 3);
+
+    // 时间快进到过期
+    store.db.prepare('UPDATE redpackets SET expires_at = ? WHERE id = ?')
+      .run(Date.now() - 1000, packetId);
+    await rp.expireSweep();
+
+    const done = store.stmts.getPacket.get(packetId);
+    assert.strictEqual(done.status, 'expired');
+    assert.strictEqual(done.refund_status, 'ok');
+    assert.strictEqual(
+      (await mockApi.getBalance('u4')).balance,
+      senderBefore - 40 + afterClaims.remaining_amount,
+      '发送者应收到剩余额度退款');
+    assert.strictEqual(
+      (await mockApi.getBalance('u5')).balance,
+      u5Before + claimAmt,
+      '领取者不受过期影响');
+    const msgId = sentMessages.at(-1).id;
+    const emb = norm(editsOf[msgId].at(-1)).embeds[0];
+    assert.match(emb.footer.text, /已过期/);
+    assert.match(emb.footer.text, /已退回/);
+  });
+
+  const failed = process.exitCode === 1 ? '有失败项！' : '全部通过 ✓';
+  console.log(`\n${passed} 项检查完成 — ${failed}`);
+  store.db.close();
+}
+
+run().catch((err) => {
+  console.error('端到端测试异常:', err);
+  process.exit(1);
+});

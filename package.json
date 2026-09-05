@@ -1,0 +1,19 @@
+{
+  "name": "dc-redpacket-bot",
+  "version": "1.0.0",
+  "description": "Discord 红包盲盒机器人：查询网站额度、发拼手气红包、过期自动退回",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "selftest": "node scripts/selftest.js",
+    "e2etest": "node scripts/e2etest.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  }
+}
