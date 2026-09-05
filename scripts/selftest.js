@@ -128,6 +128,26 @@ async function run() {
     const claim = store.stmts.getClaim.get(p.id, 'uZ');
     assert.strictEqual(claim.credit_status, 'ok');
   });
+  await ok('旧库迁移回归：无新列的 legacy 行过期后仍恰一次退款', async () => {
+    mockApi.reset();
+    const senderBefore = (await mockApi.getBalance('legacyS')).balance;
+    await mockApi.deduct('legacyS', 40, 'legacy_send');
+    // 原生 SQL 造旧行：不带 deduct_ref/created_at（insertPacket helper 总带新列，测不到旧行）
+    const lid = store.db.prepare(`
+      INSERT INTO redpackets (guild_id, channel_id, sender_id, total_amount, count,
+                              remaining_amount, remaining_count, expires_at, status, refund_status)
+      VALUES ('g1', 'c1', 'legacyS', 40, 2, 40, 2, ?, 'active', 'none')`)
+      .run(now - 1000).lastInsertRowid;
+    store.claimTx(lid, 'uL', now);
+    await rp.expireSweep(now);
+    const row = store.stmts.getPacket.get(lid);
+    assert.strictEqual(row.status, 'expired');
+    assert.strictEqual(row.refund_status, 'ok');
+    assert.strictEqual(
+      (await mockApi.getBalance('legacyS')).balance,
+      senderBefore - 40 + row.remaining_amount,
+      'legacy 行（deduct_ref 为 NULL）的剩余额度应走 refund_<id> 恰一次退回');
+  });
 
   console.log('— 发红包（createPacket 端到端，stub 频道）—');
   mockApi.reset();

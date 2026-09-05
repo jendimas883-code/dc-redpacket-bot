@@ -19,13 +19,15 @@ function setClient(c) { client = c; }
 
 const fmt = (n) => Number(n).toLocaleString('en-US');
 
-// 网站明确拒绝、重试也不可能成功的错误；NETWORK/5xx 属于结果未知，交给 sweep 用同一 ref 重试收敛
+// 网站明确拒绝、重试也不可能成功的错误。NETWORK/5xx/HTTP_408/409/425 属于结果未知
+// （请求可能已在网站生效）——判成未知最多多试几次（同 ref 幂等，重试安全），
+// 判成确定丢的是真钱，所以拿不准一律按未知处理，交给 sweep 收敛
+const DEFINITIVE_CODES = new Set(['USER_NOT_FOUND', 'INSUFFICIENT_BALANCE', 'UNAUTHORIZED']);
+const AMBIGUOUS_HTTP = new Set(['HTTP_408', 'HTTP_409', 'HTTP_425']);
 function isDefinitive(err) {
   const code = err?.code || '';
-  return code === 'USER_NOT_FOUND'
-    || code === 'INSUFFICIENT_BALANCE'
-    || code === 'UNAUTHORIZED'
-    || (/^HTTP_4/.test(code) && code !== 'HTTP_429');
+  return DEFINITIVE_CODES.has(code)
+    || (/^HTTP_4\d\d$/.test(code) && !AMBIGUOUS_HTTP.has(code));
 }
 
 function parseAmount(text) {
@@ -55,14 +57,22 @@ function balanceCard(userId, balance) {
 
 function packetEmbed(packet, claims) {
   const done = packet.status !== 'active';
-  const lines = claims.slice(0, 20).map((c, i) =>
-    `${i + 1}. <@${c.user_id}> — **${fmt(c.amount)}** ${UNIT_NAME}`);
+  const lines = claims.slice(0, 20).map((c, i) => {
+    let tag = '';
+    if (c.credit_status === 'failed') {
+      tag = c.refund_status === 'ok' ? '（未到账，已退回发起者）'
+        : c.refund_status === 'pending' ? '（未到账，退回中）' : '（未到账）';
+    }
+    return `${i + 1}. <@${c.user_id}> — **${fmt(c.amount)}** ${UNIT_NAME}${tag}`;
+  });
   if (claims.length > 20) lines.push(`…等共 ${claims.length} 人`);
 
   const footer = packet.status === 'expired'
     ? (packet.refund_status === 'ok'
       ? `已过期，剩余 ${fmt(packet.remaining_amount)} ${UNIT_NAME}已退回`
-      : packet.remaining_amount > 0 ? '已过期，剩余额度退回中…' : '已过期')
+      : packet.refund_status === 'failed'
+        ? `已过期，剩余 ${fmt(packet.remaining_amount)} ${UNIT_NAME}退回失败，请联系管理员`
+        : packet.remaining_amount > 0 ? '已过期，剩余额度退回中…' : '已过期')
     : packet.status === 'finished' ? '已抢完'
       : `剩余 ${packet.remaining_count}/${packet.count} 份 · ${
         new Date(packet.expires_at).toLocaleString('zh-CN')} 过期`;
@@ -181,7 +191,8 @@ async function createPacket({ guildId, channel, senderId, countText, totalText }
     store.stmts.activatePacket.run(packet.id);
     return { ok: true, packet: store.stmts.getPacket.get(packet.id) };
   } catch (err) {
-    // 发红包后半程失败，把扣掉的钱退回去（credit 幂等，重试安全）
+    // 发红包后半程失败，把扣掉的钱退回去。退款键固定 refund_${deductRef}：
+    // sweep 的 cancelled 分支用同一个键重试，网站幂等层恰好去重（H1 教训：换键 = 双退款）
     console.error('[redpacket] 创建红包失败，退款中:', err);
     let refunded = true;
     try {
@@ -190,9 +201,9 @@ async function createPacket({ guildId, channel, senderId, countText, totalText }
       refunded = false;
       console.error('[redpacket] 退款失败，已标记待 sweep 重试:', refundErr, deductRef);
     }
-    // 关键：红包从未面世，作废它，否则过期 sweep 会用另一个幂等键把剩余额度再退一次（双退款）
-    store.stmts.cancelPacket.run(packet.id);
-    if (!refunded) store.stmts.setRefundStatus.run('pending', packet.id);
+    // 红包从未面世，作废它，否则过期 sweep 会把剩余额度再退一次。
+    // 作废与 pending 标记同事务落库（E1）：进程死在中间也不会留下谁都看不见的孤儿行
+    store.cancelPacketTx(packet.id, refunded ? null : 'pending');
     return {
       ok: false,
       error: refunded ? '发送失败，额度已退回，请稍后重试' : '发送失败，额度退回遇到网络问题，稍后会自动重试',
@@ -224,21 +235,23 @@ async function handleGrab(interaction) {
   // 先应答占用 Discord 3 秒窗口；入账要等网站（最长 10 秒），完成后编辑同一条回复
   await interaction.deferReply({ ephemeral: true });
 
-  // 入账失败不回滚领取资格，标记 pending 由定时任务用同一幂等键重试
-  let creditOk = true;
+  // 入账失败不回滚领取资格，状态一律留给 sweep 收敛；这里只按错误类型选文案
+  let creditNote;
   try {
     await api.credit(userId, result.amount, 'redpacket_claim', `claim_${result.claimId}`);
     store.stmts.setClaimCreditStatus.run('ok', result.claimId);
+    creditNote = 'ok';
   } catch (err) {
-    creditOk = false;
+    creditNote = isDefinitive(err) ? 'rejected' : 'unknown';
     console.error(`[redpacket] 入账失败，待重试 (claim ${result.claimId}):`, err.message);
   }
 
-  await interaction.editReply({
-    content: creditOk
-      ? `🎉 抢到 **${fmt(result.amount)}** ${UNIT_NAME}！已存入你的额度`
-      : `🎉 抢到 **${fmt(result.amount)}** ${UNIT_NAME}！入账稍有延迟，稍后自动到账`,
-  });
+  const note = {
+    ok: `🎉 抢到 **${fmt(result.amount)}** ${UNIT_NAME}！已存入你的额度`,
+    rejected: `🎉 抢到 **${fmt(result.amount)}** ${UNIT_NAME}！这份额度暂时无法入账，会退回红包发起者`,
+    unknown: `🎉 抢到 **${fmt(result.amount)}** ${UNIT_NAME}！入账稍有延迟，稍后自动到账`,
+  }[creditNote];
+  await interaction.editReply({ content: note });
   await refreshMessage(store.stmts.getPacket.get(packetId));
 }
 
@@ -256,8 +269,8 @@ async function expireSweep(now = Date.now()) {
       store.stmts.cancelPacket.run(p.id);
     } catch (err) {
       if (isDefinitive(err)) {
-        // 扣款被网站明确拒绝 = 钱没扣，直接作废；扣款成功后退款被明确拒绝 = 需人工处理
-        store.stmts.cancelPacket.run(p.id);
+        // 扣款被网站明确拒绝 = 钱没扣，直接作废；扣款成功后退款被明确拒绝 = 终态 failed 留人工
+        store.cancelPacketTx(p.id, deducted ? 'failed' : null);
         if (deducted) {
           console.error(`[redpacket] 退款被网站拒绝，需人工处理 (packet ${p.id}, ref refund_${p.deduct_ref}):`, err.message);
         }
@@ -274,11 +287,27 @@ async function expireSweep(now = Date.now()) {
       store.stmts.setClaimCreditStatus.run('ok', c.id);
     } catch (err) {
       if (isDefinitive(err)) {
-        // 网站明确拒绝（如用户从未登录网站），重试永远不会成功，标记 failed 止损
-        store.stmts.setClaimCreditStatus.run('failed', c.id);
-        console.error(`[redpacket] 入账被网站拒绝，停止重试 (claim ${c.id}):`, err.message);
+        // 重试永远不会成功（如用户从未登录网站）：终态 failed，份额退回发送者，
+        // 两步同事务，防止这笔钱既不入账也不退回被凭空销毁（H3）
+        store.failClaimTx(c.id);
+        console.error(`[redpacket] 入账被网站拒绝，份额将退回发起者 (claim ${c.id}):`, err.message);
       } else {
         console.error(`[redpacket] 入账重试失败 (claim ${c.id}):`, err.message);
+      }
+    }
+  }
+
+  // 1b) 把被明确拒绝的领取份额退回发送者（独立键 refund_claim_，与该份额的入账键不重合）
+  for (const c of store.stmts.getPendingClaimRefunds.all()) {
+    try {
+      await api.credit(c.sender_id, c.amount, 'redpacket_refund', `refund_claim_${c.id}`);
+      store.stmts.setClaimRefundStatus.run('ok', c.id);
+    } catch (err) {
+      if (isDefinitive(err)) {
+        store.stmts.setClaimRefundStatus.run('failed', c.id);
+        console.error(`[redpacket] 份额退款被网站拒绝，停止重试，需人工处理 (claim ${c.id}):`, err.message);
+      } else {
+        console.error(`[redpacket] 份额退款重试失败 (claim ${c.id}):`, err.message);
       }
     }
   }
@@ -290,14 +319,35 @@ async function expireSweep(now = Date.now()) {
     await refreshMessage(store.stmts.getPacket.get(p.id));
   }
 
-  // 3) 退回剩余额度给发送者
+  // 3) 退回剩余/全部额度。退款键按 status 分流（H1 教训：换键 = 绕过网站幂等）：
+  //    cancelled（从未面世的红包）→ 用扣款 ref 派生的键，与首次补偿退款同一键，重试恰好去重；
+  //    expired（发出后没人抢完的剩余）→ 独立的一笔钱，用 refund_<packetId>。
+  //    其他组合不换键不静默跳过，留日志人工处理。
   for (const p of store.stmts.getPendingRefunds.all()) {
+    let ref;
+    if (p.status === 'cancelled') {
+      if (!p.deduct_ref) {
+        console.error(`[redpacket] 作废红包缺少 deduct_ref，无法构造退款幂等键，需人工处理 (packet ${p.id})`);
+        continue;
+      }
+      ref = `refund_${p.deduct_ref}`;
+    } else if (p.status === 'expired') {
+      ref = `refund_${p.id}`;
+    } else {
+      console.error(`[redpacket] 未预期的待退款组合 (packet ${p.id}, status ${p.status})，留人工处理`);
+      continue;
+    }
     try {
-      await api.credit(p.sender_id, p.remaining_amount, 'redpacket_refund', `refund_${p.id}`);
+      await api.credit(p.sender_id, p.remaining_amount, 'redpacket_refund', ref);
       store.stmts.setRefundStatus.run('ok', p.id);
       await refreshMessage(store.stmts.getPacket.get(p.id));
     } catch (err) {
-      console.error(`[redpacket] 退款失败，待重试 (packet ${p.id}):`, err.message);
+      if (isDefinitive(err)) {
+        store.stmts.setRefundStatus.run('failed', p.id);
+        console.error(`[redpacket] 退款被网站明确拒绝，停止重试，需人工处理 (packet ${p.id}, ref ${ref}):`, err.message);
+      } else {
+        console.error(`[redpacket] 退款失败，待重试 (packet ${p.id}):`, err.message);
+      }
     }
   }
 }

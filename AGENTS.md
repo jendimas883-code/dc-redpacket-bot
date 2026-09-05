@@ -25,16 +25,17 @@ Discord 红包盲盒机器人：查网站额度、发拼手气红包、抢红包
 
 ## 测试规范
 
-- 两套自测脚本（无测试框架，见 workflow.md〈测试命令〉）：
+- 三套自测脚本（无测试框架，见 workflow.md〈测试命令〉）：
   - `scripts/selftest.js` — 核心逻辑，每个用例是 `ok('名字', fn)`；改 store/redpacket/mockApi 必须在这里补用例。
   - `scripts/e2etest.js` — 用假 interaction 对象驱动真实 handler；改 commands/ 或交互流程在这里补用例。
-- **资金路径的用例必须含失败注入**（发送失败退款、入账失败补发——参照现有 `频道发送失败时自动退款` / `入账失败的领取由 sweep 补发` 用例）。
-- 测试自带环境（临时 DB + MOCK_API），跑完不残留：两套都 `fs.rmSync('./data', ...)` 清场。
-- 提交前跑 `npm run selftest && npm run e2etest`，两段"全部通过 ✓"才算绿。
+  - `scripts/flowtest.js` — 整体流程演练：多用户多红包交错剧本 + 金额守恒总账核对（全场初始额度 = 最终额度，分毫不差）；动资金路径后必跑。
+- **资金路径的用例必须含失败注入**（发送失败退款、入账失败补发、退款超时同键收敛——参照现有 `频道发送失败时自动退款` / `入账失败的领取由 sweep 补发` / `首次退款超时但网站已入账` 用例）。
+- 测试自带环境（临时 DB + MOCK_API），跑完不残留：各用独立临时目录（`.tmp-selftest/`、`.tmp-e2etest/`、`.tmp-flowtest/`）清场，**绝不碰生产库所在的 `./data/`**。
+- 提交前跑 `npm run selftest && npm run e2etest && npm run flowtest`，每段"全部通过 ✓"才算绿。
 
 ## 环境与依赖
 
-- Node ≥20（本机 v24）。依赖保持最小：目前只有 discord.js / better-sqlite3 / dotenv，加依赖先问一句"标准库或现有依赖能不能干"。
+- Node ≥20（本机见 `node -v`，曾记录 v22/v24 两种环境，二进制镜像对两者都有预编译包）。依赖保持最小：目前只有 discord.js / better-sqlite3 / dotenv，加依赖先问一句"标准库或现有依赖能不能干"。
 - **better-sqlite3 原生模块**：本机 npm 走 npmmirror、无 VS 编译环境，安装必须用二进制镜像：
   ```bash
   npm_config_better_sqlite3_binary_host_mirror="https://registry.npmmirror.com/-/binary/better-sqlite3" npm install

@@ -35,6 +35,7 @@ db.exec(`
     amount        INTEGER NOT NULL,
     claimed_at    INTEGER NOT NULL,
     credit_status TEXT NOT NULL DEFAULT 'pending',
+    refund_status TEXT NOT NULL DEFAULT 'none',
     UNIQUE(packet_id, user_id)
   );
   CREATE INDEX IF NOT EXISTS idx_claims_packet ON claims(packet_id);
@@ -43,6 +44,7 @@ db.exec(`
 // 老库平滑升级：新列已存在时 ALTER 会报错，忽略即可
 try { db.exec('ALTER TABLE redpackets ADD COLUMN deduct_ref TEXT'); } catch { /* 已有该列 */ }
 try { db.exec('ALTER TABLE redpackets ADD COLUMN created_at INTEGER'); } catch { /* 已有该列 */ }
+try { db.exec("ALTER TABLE claims ADD COLUMN refund_status TEXT NOT NULL DEFAULT 'none'"); } catch { /* 已有该列 */ }
 
 const stmts = {
   insertPacket: db.prepare(`
@@ -77,6 +79,10 @@ const stmts = {
   getClaim: db.prepare('SELECT * FROM claims WHERE packet_id = ? AND user_id = ?'),
   listClaims: db.prepare('SELECT * FROM claims WHERE packet_id = ? ORDER BY id'),
   setClaimCreditStatus: db.prepare('UPDATE claims SET credit_status = ? WHERE id = ?'),
+  setClaimRefundStatus: db.prepare('UPDATE claims SET refund_status = ? WHERE id = ?'),
+  getPendingClaimRefunds: db.prepare(`
+    SELECT c.*, p.sender_id FROM claims c JOIN redpackets p ON p.id = c.packet_id
+    WHERE c.refund_status = 'pending'`),
   getPendingCredits: db.prepare(`
     SELECT c.*, p.id AS packet_id FROM claims c JOIN redpackets p ON p.id = c.packet_id
     WHERE c.credit_status = 'pending' AND c.claimed_at <= ?`),
@@ -110,4 +116,17 @@ function splitRand(remainingAmount, remainingCount) {
   return 1 + Math.floor(Math.random() * upper);
 }
 
-module.exports = { db, stmts, claimTx, splitRand, DB_PATH };
+// 作废红包与补偿标记（pending/failed）必须同事务落库：进程死在中间也不会留下
+// "cancelled + none" 这种阶段 0 和阶段 3 都看不见的孤儿行（资金滞留无补偿通道）
+const cancelPacketTx = db.transaction((id, refundStatus) => {
+  stmts.cancelPacket.run(id);
+  if (refundStatus) stmts.setRefundStatus.run(refundStatus, id);
+});
+
+// 领取入账被网站明确拒绝：终态 failed 与"份额退回发送者"的标记同事务，防止份额被销毁
+const failClaimTx = db.transaction((claimId) => {
+  stmts.setClaimCreditStatus.run('failed', claimId);
+  stmts.setClaimRefundStatus.run('pending', claimId);
+});
+
+module.exports = { db, stmts, claimTx, splitRand, cancelPacketTx, failClaimTx, DB_PATH };
