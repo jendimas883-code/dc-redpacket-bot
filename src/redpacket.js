@@ -61,7 +61,8 @@ function packetEmbed(packet, claims) {
     let tag = '';
     if (c.credit_status === 'failed') {
       tag = c.refund_status === 'ok' ? '（未到账，已退回发起者）'
-        : c.refund_status === 'pending' ? '（未到账，退回中）' : '（未到账）';
+        : c.refund_status === 'pending' ? '（未到账，退回中）'
+        : c.refund_status === 'failed' ? '（未到账，退回失败，请联系管理员）' : '（未到账）';
     }
     return `${i + 1}. <@${c.user_id}> — **${fmt(c.amount)}** ${UNIT_NAME}${tag}`;
   });
@@ -250,7 +251,7 @@ async function handleGrab(interaction) {
 
   const note = {
     ok: `🎉 抢到 **${fmt(result.amount)}** ${UNIT_NAME}！已存入你的额度`,
-    rejected: `🎉 抢到 **${fmt(result.amount)}** ${UNIT_NAME}！这份额度暂时无法入账，会退回红包发起者`,
+    rejected: `🎉 抢到 **${fmt(result.amount)}** ${UNIT_NAME}！这份额度暂时无法入账，稍后自动重试，若仍失败会退回红包发起者`,
     unknown: `🎉 抢到 **${fmt(result.amount)}** ${UNIT_NAME}！入账稍有延迟，稍后自动到账`,
   }[creditNote];
   await interaction.editReply({ content: note });
