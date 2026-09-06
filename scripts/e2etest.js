@@ -3,7 +3,8 @@
 // 端到端交互测试：npm run e2etest
 // 用假的 Discord interaction 对象驱动真实的事件处理代码（commands/balance.js、redpacket.js），
 // 完整走一遍：查额度 → 弹表单 → 发红包 → 抢 → 重复领 → 抢完 → 输入校验 → 余额不足 →
-// 发送失败退款 → 过期退款。不需要 Discord token，不需要网站接口。
+// 发送失败退款 → 过期退款 → 止损（补偿被网站明确拒绝 → failed 终态）。
+// 不需要 Discord token，不需要网站接口。
 
 process.env.DB_PATH = './.tmp-e2etest/e2etest.db';
 process.env.MOCK_API = 'true';
@@ -460,6 +461,152 @@ async function run() {
     const emb = norm(editsOf[msgId].at(-1)).embeds[0];
     assert.match(emb.footer.text, /已过期/);
     assert.match(emb.footer.text, /已退回/);
+  });
+
+  console.log('— 止损：补偿被网站明确拒绝 → failed 终态，停止重试 —');
+  // 止损 = failed 行脱离全部待办队列（getStaleCreating / getPendingClaimRefunds /
+  // getPendingRefunds 均按状态过滤）。钉法：计数 sweep 后所有 credit+deduct 调用增量
+  // 必须为 0（含 throw 前的调用，防换键/换对象绕过前缀过滤），配余额不变作账面二保险。
+  // 以下用例依赖前面的用例已把各自的 pending 全部收敛完毕，计数不被遗留行污染。
+  await ok('阶段0：确认扣款后补偿退款被明确拒绝 → failed 止损，不再重试', async () => {
+    const api = require('../src/api');
+    const { ApiError } = require('../src/apiError');
+    const before = (await mockApi.getBalance('u1')).balance;
+    const origDeduct = api.deduct;
+    const origCredit = api.credit;
+    try {
+      // 站点事务已提交、响应丢失：首调真实扣款后抛 NETWORK，红包停在 creating
+      let deductSeen = false;
+      api.deduct = async (discordId, amount, ref) => {
+        await mockApi.deduct(discordId, amount, ref);
+        if (!deductSeen) {
+          deductSeen = true;
+          throw new ApiError('NETWORK', '模拟扣款响应超时');
+        }
+        return { balance: (await mockApi.getBalance(discordId)).balance };
+      };
+      api.credit = async () => { throw new ApiError('USER_NOT_FOUND', '用户不存在'); };
+      const calls = await submitModal('u1', '2', '20');
+      assert.match(calls.editReply[0].content, /核对/, '扣款结果未知应告知额度在核对中');
+      const pid = store.db.prepare('SELECT MAX(id) AS id FROM redpackets').get().id;
+      assert.strictEqual(store.stmts.getPacket.get(pid).status, 'creating');
+      store.db.prepare('UPDATE redpackets SET created_at = ? WHERE id = ?')
+        .run(Date.now() - 120_000, pid);
+      // 阶段0：同 ref 重试扣款（mock 幂等去重）→ 确认扣上 → 补偿退款被明确拒绝 → failed
+      await rp.expireSweep();
+      const row = store.stmts.getPacket.get(pid);
+      assert.strictEqual(row.status, 'cancelled');
+      assert.strictEqual(row.refund_status, 'failed', '补偿退款被明确拒绝应标 failed 止损');
+      assert.strictEqual((await mockApi.getBalance('u1')).balance, before - 20,
+        '钱滞留待人工处理，账面不得变动');
+
+      let apiCalls = 0;
+      api.credit = async (...a) => { apiCalls += 1; return origCredit(...a); };
+      api.deduct = async (...a) => { apiCalls += 1; return origDeduct(...a); };
+      await rp.expireSweep();
+      assert.strictEqual(apiCalls, 0, 'failed 止损后 sweep 不得再发起任何资金调用');
+      assert.strictEqual((await mockApi.getBalance('u1')).balance, before - 20);
+    } finally {
+      api.deduct = origDeduct;
+      api.credit = origCredit;
+    }
+  });
+
+  await ok('阶段3：作废红包的补偿退款被明确拒绝 → failed 止损，不再重试', async () => {
+    const api = require('../src/api');
+    const { ApiError } = require('../src/apiError');
+    const before = (await mockApi.getBalance('u1')).balance;
+    const origCredit = api.credit;
+    try {
+      // 首退响应丢失（未入账）→ cancelled + pending
+      api.credit = async () => { throw new ApiError('NETWORK', '模拟退款响应丢失'); };
+      channel.shouldFailSend = true;
+      try {
+        await submitModal('u1', '2', '20');
+      } finally {
+        channel.shouldFailSend = false;
+      }
+      const pid = store.db.prepare('SELECT MAX(id) AS id FROM redpackets').get().id;
+      const row = store.stmts.getPacket.get(pid);
+      assert.strictEqual(row.status, 'cancelled');
+      assert.strictEqual(row.refund_status, 'pending', '首退结果未知应标 pending');
+      assert.strictEqual((await mockApi.getBalance('u1')).balance, before - 20, '首退未生效');
+
+      // 阶段3 cancelled 臂：同键 refund_${deduct_ref} 重试这次被网站明确拒绝 → failed
+      api.credit = async () => { throw new ApiError('USER_NOT_FOUND', '用户不存在'); };
+      await rp.expireSweep();
+      assert.strictEqual(store.stmts.getPacket.get(pid).refund_status, 'failed',
+        '明确拒绝应标 failed 止损');
+      assert.strictEqual((await mockApi.getBalance('u1')).balance, before - 20);
+
+      let apiCalls = 0;
+      api.credit = async (...a) => { apiCalls += 1; return origCredit(...a); };
+      await rp.expireSweep();
+      assert.strictEqual(apiCalls, 0, 'failed 止损后 sweep 不得再发起任何资金调用');
+    } finally {
+      api.credit = origCredit;
+    }
+  });
+
+  await ok('阶段1+1b：入账与份额退回都被明确拒绝 → failed 止损，消息如实展示', async () => {
+    const api = require('../src/api');
+    const { ApiError } = require('../src/apiError');
+    const origCredit = api.credit;
+    // 2 份包：1 份被抢（入账/份额退款全被拒 → 止损），1 份走正常过期退款作对照
+    await submitModal('u8', '2', '10');
+    const pid = store.db.prepare('SELECT MAX(id) AS id FROM redpackets').get().id;
+    const msgId = sentMessages.at(-1).id;
+    const senderAfterSend = (await mockApi.getBalance('u8')).balance;
+    const grabberBefore = (await mockApi.getBalance('u9')).balance;
+    try {
+      // 只拦 claim_ 入账与 refund_claim_ 份额退款两个键，放行对照份额的 refund_<id>
+      api.credit = async (discordId, amount, purpose, ref) => {
+        const r = String(ref);
+        if (r.startsWith('claim_') || r.startsWith('refund_claim_')) {
+          throw new ApiError('USER_NOT_FOUND', '用户不存在');
+        }
+        return origCredit(discordId, amount, purpose, ref);
+      };
+      const { i, calls } = makeInteraction({
+        customId: `rp_grab_${pid}`, user: { id: 'u9', bot: false },
+      });
+      await rp.handleGrab(i);
+      const grabbed = Number(calls.editReply[0].content.match(/抢到 \*\*(\d+)\*\*/)[1]);
+      const claimId = store.db.prepare('SELECT MAX(id) AS id FROM claims').get().id;
+      store.db.prepare('UPDATE claims SET claimed_at = ? WHERE id = ?')
+        .run(Date.now() - 120_000, claimId);
+      // 阶段1 重试入账仍被拒 → failClaimTx；阶段1b 份额退款被拒 → failed 止损
+      await rp.expireSweep();
+      const c = store.db.prepare(
+        'SELECT credit_status, refund_status FROM claims WHERE id = ?').get(claimId);
+      assert.strictEqual(c.credit_status, 'failed');
+      assert.strictEqual(c.refund_status, 'failed', '份额退款被明确拒绝应标 failed 止损');
+      assert.strictEqual((await mockApi.getBalance('u9')).balance, grabberBefore, '领取者未入账');
+      assert.strictEqual((await mockApi.getBalance('u8')).balance, senderAfterSend,
+        '份额滞留待人工，发送者未收到');
+
+      // 1b 止损路径不刷新消息：借阶段2 的过期刷新让 embed 反映 failed 终态
+      store.db.prepare('UPDATE redpackets SET expires_at = ? WHERE id = ?')
+        .run(Date.now() - 1000, pid);
+      await rp.expireSweep();
+      assert.strictEqual((await mockApi.getBalance('u8')).balance,
+        senderAfterSend + (10 - grabbed), '未领份额应正常过期退回（对照组）');
+      const emb = norm(editsOf[msgId].at(-1)).embeds[0];
+      assert.match(emb.footer.text, /已过期.*已退回/);
+      const rowLine = emb.fields[0].value;
+      assert.match(rowLine, new RegExp(`<@u9> — \\*\\*${grabbed}\\*\\*`), '应列出 failed 份额的行');
+      assert.match(rowLine, /（未到账，退回失败，请联系管理员）/, 'failed 份额应如实标注退回失败');
+    } finally {
+      api.credit = origCredit;
+    }
+    let apiCalls = 0;
+    api.credit = async (...a) => { apiCalls += 1; return origCredit(...a); };
+    try {
+      await rp.expireSweep();
+    } finally {
+      api.credit = origCredit;
+    }
+    assert.strictEqual(apiCalls, 0, 'failed 止损后 sweep 不得再发起任何资金调用');
   });
 
   const failed = process.exitCode === 1 ? '有失败项！' : '全部通过 ✓';
