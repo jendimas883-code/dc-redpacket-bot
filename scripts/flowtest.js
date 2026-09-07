@@ -179,6 +179,8 @@ async function main() {
   console.log(`  总账：${USERS.length} 人合计 ${total} = 初始 ${USERS.length * START} ✓ 分毫不差`);
   console.log('\n整体流程演练：全部通过 ✓');
   store.db.close();
+  // 绿灯才清场：失败保留现场供排查，下次开跑时开头的 rmSync 兜底保证无残留
+  fs.rmSync('./.tmp-flowtest', { recursive: true, force: true });
 }
 
 main().catch((err) => {
